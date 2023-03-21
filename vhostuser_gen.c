@@ -198,20 +198,65 @@ l2fwd_simple_forward(struct rte_mbuf *m, unsigned portid)
 /* >8 End of simple forward. */
 
 static void
-init_pkt(struct rte_mbuf *m)
+init_pkt(struct rte_mbuf *m, uint32_t counter)
 {
 	struct rte_ether_hdr *eth;
+	struct rte_ether_addr eth_src_addr, eth_dst_addr;
+	struct rte_ipv4_hdr *iph;
+	struct rte_udp_hdr *udph;
+	uint32_t *l4_payload;
+	uint32_t l4_payload_len;
+
+	/* Set rte_mbuf hdr */
 #define PKT_LEN 128
 	m->pkt_len = PKT_LEN;
 	m->data_len = PKT_LEN;
 
-		// ether hdr 14byte
+	/* Set ethernet hdr */
 	eth = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
-	// akiyama32 PORT 0 addr
-	rte_ether_unformat_addr("a0:36:9f:3f:20:24", &eth->dst_addr);
-	// localhost PORT 0 addr
-	rte_ether_unformat_addr("a0:36:9f:53:9e:1c", &eth->src_addr);
+	if (unlikely(rte_eth_macaddr_get(0, &eth_src_addr))) {
+		puts("error in getting eth_src_addr");
+		rte_ether_unformat_addr("a0:36:9f:53:9e:1c", &eth->src_addr);
+	}
+	eth->src_addr = eth_src_addr;
+	if (unlikely(rte_eth_macaddr_get(1, &eth_dst_addr))) {
+		puts("error in getting eth_dst_addr");
+		rte_ether_unformat_addr("a0:36:9f:3f:20:24", &eth->dst_addr);
+	}
+	eth->dst_addr = eth_dst_addr;
 	eth->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
+
+	/* Set IPv4 hdr */
+	iph = (struct rte_ipv4_hdr *)(eth + 1);
+	iph->version = 4;
+	iph->ihl = sizeof(struct rte_ipv4_hdr) / 4;
+	iph->type_of_service = 0;
+	iph->total_length = rte_cpu_to_be_16(PKT_LEN - RTE_ETHER_HDR_LEN);
+	iph->packet_id = 0;
+	iph->fragment_offset = 0;
+	iph->time_to_live = 64;
+	iph->next_proto_id = IPPROTO_UDP;
+	iph->hdr_checksum = 0;
+	iph->src_addr = RTE_IPV4(1, 0, 168, 192);
+	iph->dst_addr = RTE_IPV4(2, 0, 168, 192);
+
+	/* Set UDP hdr */
+	udph = (struct rte_udp_hdr *)(iph + 1);
+	udph->src_port = rte_cpu_to_be_16(1000);
+	udph->dst_port = rte_cpu_to_be_16(2000);
+	udph->dgram_len = rte_cpu_to_be_16(PKT_LEN - RTE_ETHER_HDR_LEN 
+										- sizeof(struct rte_ipv4_hdr));
+	udph->dgram_cksum = 0;
+
+	/* Set payload*/
+	l4_payload = (uint32_t *)(udph + 1);
+	l4_payload_len = PKT_LEN - RTE_ETHER_HDR_LEN
+						- sizeof(struct rte_ipv4_hdr)
+						- sizeof(struct rte_udp_hdr);
+	*l4_payload = rte_cpu_to_be_32(counter);
+
+	l4_payload = (uint32_t *)((char *)l4_payload + l4_payload_len - sizeof(uint32_t));
+	*l4_payload = rte_cpu_to_be_32(counter ^ 0xffffffff);
 }
 
 static void
@@ -224,6 +269,7 @@ mygen_tx_loop(void)
 	unsigned i, j, portid, nb_rx;
 	struct lcore_queue_conf *qconf;
 	unsigned dst_port;
+	uint32_t counter = 0;
 
 	lcore_id = rte_lcore_id();
 	qconf = &lcore_queue_conf[lcore_id];
@@ -252,7 +298,7 @@ mygen_tx_loop(void)
 		}
 
 		for (j = 0; j < MAX_PKT_BURST; ++j) {
-			init_pkt(bufs[j]);
+			init_pkt(bufs[j], counter++);
 		}
 		nb_tx = rte_eth_tx_burst(0, 0, bufs, MAX_PKT_BURST);
 		if (unlikely(nb_tx < MAX_PKT_BURST)) {
@@ -269,6 +315,13 @@ mygen_rx_loop(void)
 	unsigned lcore_id;
 	unsigned i, j, portid, nb_rx;
 	struct lcore_queue_conf *qconf;
+	struct rte_ether_hdr *eth;
+	struct rte_ipv4_hdr *iph = NULL;
+	struct rte_udp_hdr *udph = NULL;
+	uint32_t *l4_payload = NULL;
+	uint32_t *verif = NULL;
+	uint32_t l4_payload_len;
+	uint32_t counter = 0;
 
 	lcore_id = rte_lcore_id();
 	qconf = &lcore_queue_conf[lcore_id];
@@ -307,11 +360,38 @@ mygen_rx_loop(void)
 				m = pkts_burst[j];
 				// rte_prefetch0(rte_pktmbuf_mtod(m, void *));
 				// l2fwd_simple_forward(m, portid);
+				eth = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
+				if (eth->ether_type == rte_be_to_cpu_16(RTE_ETHER_TYPE_IPV4)) {
+					iph = (struct rte_ipv4_hdr *)(eth + 1);
+				} else {
+					puts("Not IPv4");
+				}
+				if (iph != NULL) {
+					if (iph->next_proto_id == IPPROTO_UDP) {
+						udph = (struct rte_udp_hdr *)(iph + 1);
+						l4_payload = (uint32_t *)(udph + 1);
+					} else {
+						puts("Not UDP");
+					}
+				}
+				if (udph != NULL) {
+					l4_payload_len = rte_be_to_cpu_16(udph->dgram_len) - sizeof(struct rte_udp_hdr);
+					verif = (uint32_t *)((char *)l4_payload + l4_payload_len - sizeof(uint32_t));
+
+					if ((*l4_payload ^ *verif) != 0xffffffff) {
+						puts("Bad Verif");
+					}
+				}
 			}
 
 			rte_pktmbuf_free_bulk(pkts_burst, nb_rx);
+			counter += nb_rx;
 		}
 
+		if (counter > 100000000 && nb_rx < 1) {
+			puts("Finish!");
+			force_quit = true;
+		}
 		/* >8 End of read packet from RX queues. */
 	}
 }
